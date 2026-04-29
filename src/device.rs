@@ -48,17 +48,20 @@ impl Device for VirtualDevice {
             return None;
         };
 
-        let Ok(permit) = self.out_buf.try_reserve() else {
-            self.in_buf_avail.store(false, Ordering::Release);
-            return None;
+        // When the outbound queue is full, still process ingress (including ACKs) so smoltcp can
+        // update the window and drain its internal tx_buffer. Response frames for this cycle are
+        // dropped via Null; the peer can recover via TCP retransmission.
+        let tx = match self.out_buf.try_reserve() {
+            Ok(permit) => VirtualTxToken::Normal(permit),
+            Err(_) => VirtualTxToken::Null,
         };
 
-        Some((Self::RxToken { buffer }, Self::TxToken { permit }))
+        Some((Self::RxToken { buffer }, tx))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         match self.out_buf.try_reserve() {
-            Ok(permit) => Some(Self::TxToken { permit }),
+            Ok(permit) => Some(VirtualTxToken::Normal(permit)),
             Err(_) => None,
         }
     }
@@ -84,8 +87,11 @@ impl RxToken for VirtualRxToken {
     }
 }
 
-pub(super) struct VirtualTxToken<'a> {
-    permit: Permit<'a, Vec<u8>>,
+/// When the egress channel has capacity, use `Normal` to deliver generated IP packets.
+/// When full, use `Null`: smoltcp write callbacks still run but nothing is sent upstream.
+pub(super) enum VirtualTxToken<'a> {
+    Normal(Permit<'a, Vec<u8>>),
+    Null,
 }
 
 impl<'a> TxToken for VirtualTxToken<'a> {
@@ -95,7 +101,9 @@ impl<'a> TxToken for VirtualTxToken<'a> {
     {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
-        self.permit.send(buffer);
+        if let Self::Normal(permit) = self {
+            permit.send(buffer);
+        }
         result
     }
 }
