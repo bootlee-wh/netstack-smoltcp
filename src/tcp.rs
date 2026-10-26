@@ -1,9 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     task::{Context, Poll, Waker},
@@ -34,6 +34,47 @@ use crate::{
     Runner,
 };
 
+/// Timeout for a socket that has not finished the 3-way handshake (Listen /
+/// SynReceived). Once established the socket switches to `ESTABLISHED_TIMEOUT`.
+/// Without it a half-open socket (client gave up) keeps both window buffers for
+/// up to two hours.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+// FIXME: It should follow system's setting. 7200 is Linux's default.
+const ESTABLISHED_TIMEOUT: Duration = Duration::from_secs(7200);
+
+static TCP_SOCKETS_ALIVE: AtomicUsize = AtomicUsize::new(0);
+static TCP_SOCKETS_HANDSHAKING: AtomicUsize = AtomicUsize::new(0);
+static TCP_DUP_SYN_IGNORED: AtomicU64 = AtomicU64::new(0);
+static TCP_HANDSHAKE_ABORTED: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide TCP socket counters (summed over all stacks), for memory diagnostics.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TcpStats {
+    /// smoltcp sockets currently alive (each holds the rx/tx window buffers).
+    pub sockets: usize,
+    /// Sockets still in Listen / SynReceived.
+    pub handshaking: usize,
+    /// Retransmitted SYNs routed to the existing handshaking socket instead of
+    /// creating another one.
+    pub dup_syn_ignored: u64,
+    /// Sockets closed before the handshake completed (timeout / RST).
+    pub handshake_aborted: u64,
+}
+
+pub fn tcp_stats() -> TcpStats {
+    TcpStats {
+        sockets: TCP_SOCKETS_ALIVE.load(Ordering::Relaxed),
+        handshaking: TCP_SOCKETS_HANDSHAKING.load(Ordering::Relaxed),
+        dup_syn_ignored: TCP_DUP_SYN_IGNORED.load(Ordering::Relaxed),
+        handshake_aborted: TCP_HANDSHAKE_ABORTED.load(Ordering::Relaxed),
+    }
+}
+
+type ConnKey = (SocketAddr, SocketAddr);
+/// 4-tuples whose socket is still handshaking; shared by `handle_packet` (dedup
+/// on SYN) and `handle_socket` (removal once the handshake ends).
+type SharedPending = Arc<SpinMutex<HashSet<ConnKey>>>;
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TcpSocketState {
     Normal,
@@ -49,11 +90,36 @@ struct TcpSocketControl {
     recv_waker: Option<Waker>,
     recv_state: TcpSocketState,
     send_state: TcpSocketState,
+    // The stream-side buffers start empty and are allocated on first use, so a
+    // connection that never carries data in a direction does not pay for it.
+    recv_buffer_size: usize,
+    send_buffer_size: usize,
+}
+
+impl TcpSocketControl {
+    fn ensure_recv_buffer(&mut self) {
+        if self.recv_buffer.capacity() == 0 {
+            self.recv_buffer = RingBuffer::new(vec![0u8; self.recv_buffer_size]);
+        }
+    }
+
+    fn ensure_send_buffer(&mut self) {
+        if self.send_buffer.capacity() == 0 {
+            self.send_buffer = RingBuffer::new(vec![0u8; self.send_buffer_size]);
+        }
+    }
 }
 
 struct TcpSocketCreation {
     control: SharedControl,
     socket: TcpSocket<'static>,
+    key: ConnKey,
+}
+
+struct TcpSocketEntry {
+    control: SharedControl,
+    key: ConnKey,
+    handshaking: bool,
 }
 
 type SharedNotify = Arc<Notify>;
@@ -70,16 +136,17 @@ impl TcpListenerRunner {
         iface_ingress_tx_avail: Arc<AtomicBool>,
         tcp_rx: Receiver<AnyIpPktFrame>,
         stream_tx: UnboundedSender<TcpStream>,
-        sockets: HashMap<SocketHandle, SharedControl>,
+        sockets: HashMap<SocketHandle, TcpSocketEntry>,
         tcp_recv_buffer_size: u32,
         tcp_send_buffer_size: u32,
     ) -> Runner {
         Runner::new(async move {
             let notify = Arc::new(Notify::new());
             let (socket_tx, socket_rx) = unbounded_channel::<TcpSocketCreation>();
+            let pending: SharedPending = Arc::new(SpinMutex::new(HashSet::new()));
             let res = tokio::select! {
-                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, tcp_recv_buffer_size, tcp_send_buffer_size) => v,
-                v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx) => v,
+                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, pending.clone(), tcp_recv_buffer_size, tcp_send_buffer_size) => v,
+                v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx, pending) => v,
             };
             res?;
             trace!("VirtDevice::poll thread exited");
@@ -95,6 +162,7 @@ impl TcpListenerRunner {
         mut tcp_rx: Receiver<AnyIpPktFrame>,
         stream_tx: UnboundedSender<TcpStream>,
         socket_tx: UnboundedSender<TcpSocketCreation>,
+        pending: SharedPending,
         tcp_recv_buffer_size: u32,
         tcp_send_buffer_size: u32,
     ) -> std::io::Result<()> {
@@ -136,31 +204,51 @@ impl TcpListenerRunner {
 
             // TCP first handshake packet, create a new Connection
             if packet.syn() && !packet.ack() {
+                let key = (src_addr, dst_addr);
+                // A retransmitted SYN (client got no SYN-ACK in time, e.g. while
+                // the host is stalled) must reach the socket that is already
+                // handshaking; creating another one per retransmit multiplies the
+                // window buffers and hands duplicate streams to the caller.
+                if !pending.lock().insert(key) {
+                    TCP_DUP_SYN_IGNORED.fetch_add(1, Ordering::Relaxed);
+                    trace!("retransmitted SYN for {} <-> {}", src_addr, dst_addr);
+                    iface_ingress_tx
+                        .send(frame)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
+                    iface_ingress_tx_avail.store(true, Ordering::Release);
+                    notify.notify_one();
+                    continue;
+                }
+
                 let mut socket = TcpSocket::new(
                     TcpSocketBuffer::new(vec![0u8; tcp_recv_buffer_size as usize]),
                     TcpSocketBuffer::new(vec![0u8; tcp_send_buffer_size as usize]),
                 );
                 socket.set_keep_alive(Some(Duration::from_secs(28)));
-                // FIXME: It should follow system's setting. 7200 is Linux's default.
-                socket.set_timeout(Some(Duration::from_secs(7200)));
+                socket.set_timeout(Some(HANDSHAKE_TIMEOUT));
                 // NO ACK delay
                 // socket.set_ack_delay(None);
 
                 if let Err(err) = socket.listen(dst_addr) {
                     error!("listen error: {:?}", err);
+                    pending.lock().remove(&key);
                     continue;
                 }
 
                 trace!("created TCP connection for {} <-> {}", src_addr, dst_addr);
 
                 let control = Arc::new(SpinMutex::new(TcpSocketControl {
-                    send_buffer: RingBuffer::new(vec![0u8; tcp_send_buffer_size as usize]),
+                    send_buffer: RingBuffer::new(Vec::new()),
                     send_waker: None,
-                    recv_buffer: RingBuffer::new(vec![0u8; tcp_recv_buffer_size as usize]),
+                    recv_buffer: RingBuffer::new(Vec::new()),
                     recv_waker: None,
                     recv_state: TcpSocketState::Normal,
                     send_state: TcpSocketState::Normal,
+                    recv_buffer_size: tcp_recv_buffer_size as usize,
+                    send_buffer_size: tcp_send_buffer_size as usize,
                 }));
+                TCP_SOCKETS_ALIVE.fetch_add(1, Ordering::Relaxed);
+                TCP_SOCKETS_HANDSHAKING.fetch_add(1, Ordering::Relaxed);
 
                 stream_tx
                     .send(TcpStream {
@@ -171,7 +259,11 @@ impl TcpListenerRunner {
                     })
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
                 socket_tx
-                    .send(TcpSocketCreation { control, socket })
+                    .send(TcpSocketCreation {
+                        control,
+                        socket,
+                        key,
+                    })
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
             }
 
@@ -190,14 +282,27 @@ impl TcpListenerRunner {
         mut device: VirtualDevice,
         mut iface: Interface,
         iface_ingress_tx_avail: Arc<AtomicBool>,
-        mut sockets: HashMap<SocketHandle, SharedControl>,
+        mut sockets: HashMap<SocketHandle, TcpSocketEntry>,
         mut socket_rx: UnboundedReceiver<TcpSocketCreation>,
+        pending: SharedPending,
     ) -> std::io::Result<()> {
         let mut socket_set = SocketSet::new(vec![]);
         loop {
-            while let Ok(TcpSocketCreation { control, socket }) = socket_rx.try_recv() {
+            while let Ok(TcpSocketCreation {
+                control,
+                socket,
+                key,
+            }) = socket_rx.try_recv()
+            {
                 let handle = socket_set.add(socket);
-                sockets.insert(handle, control);
+                sockets.insert(
+                    handle,
+                    TcpSocketEntry {
+                        control,
+                        key,
+                        handshaking: true,
+                    },
+                );
             }
 
             let before_poll = Instant::now();
@@ -212,10 +317,23 @@ impl TcpListenerRunner {
             // Check all the sockets' status
             let mut sockets_to_remove = Vec::new();
 
-            for (socket_handle, control) in sockets.iter() {
+            for (socket_handle, entry) in sockets.iter_mut() {
                 let socket_handle = *socket_handle;
                 let socket = socket_set.get_mut::<TcpSocket>(socket_handle);
-                let mut control = control.lock();
+                let mut control = entry.control.lock();
+
+                if entry.handshaking
+                    && !matches!(socket.state(), TcpState::Listen | TcpState::SynReceived)
+                {
+                    entry.handshaking = false;
+                    pending.lock().remove(&entry.key);
+                    TCP_SOCKETS_HANDSHAKING.fetch_sub(1, Ordering::Relaxed);
+                    if socket.state() == TcpState::Closed {
+                        TCP_HANDSHAKE_ABORTED.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        socket.set_timeout(Some(ESTABLISHED_TIMEOUT));
+                    }
+                }
 
                 // Remove the socket only when it is in the closed state.
                 if socket.state() == TcpState::Closed {
@@ -250,6 +368,9 @@ impl TcpListenerRunner {
 
                 // Check if readable
                 let mut wake_receiver = false;
+                if socket.can_recv() {
+                    control.ensure_recv_buffer();
+                }
                 while socket.can_recv() && !control.recv_buffer.is_full() {
                     let result = socket.recv(|buffer| {
                         let n = control.recv_buffer.enqueue_slice(buffer);
@@ -338,6 +459,7 @@ impl TcpListenerRunner {
             for socket_handle in sockets_to_remove {
                 sockets.remove(&socket_handle);
                 socket_set.remove(socket_handle);
+                TCP_SOCKETS_ALIVE.fetch_sub(1, Ordering::Relaxed);
             }
 
             // Ensure every loop iteration yields to the runtime. When egress
@@ -533,6 +655,7 @@ impl AsyncWrite for TcpStream {
         }
 
         // Write to buffer
+        control.ensure_send_buffer();
 
         if control.send_buffer.is_full() {
             if let Some(old_waker) = control.send_waker.replace(cx.waker().clone()) {
