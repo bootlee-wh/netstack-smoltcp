@@ -34,10 +34,6 @@ use crate::{
     Runner,
 };
 
-// NOTE: Default buffer could contain 20 AEAD packets
-const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 0x3FFF * 20;
-const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 0x3FFF * 20;
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TcpSocketState {
     Normal,
@@ -66,6 +62,7 @@ type SharedControl = Arc<SpinMutex<TcpSocketControl>>;
 struct TcpListenerRunner;
 
 impl TcpListenerRunner {
+    #[allow(clippy::too_many_arguments)]
     fn create(
         device: VirtualDevice,
         iface: Interface,
@@ -74,12 +71,14 @@ impl TcpListenerRunner {
         tcp_rx: Receiver<AnyIpPktFrame>,
         stream_tx: UnboundedSender<TcpStream>,
         sockets: HashMap<SocketHandle, SharedControl>,
+        tcp_recv_buffer_size: u32,
+        tcp_send_buffer_size: u32,
     ) -> Runner {
         Runner::new(async move {
             let notify = Arc::new(Notify::new());
             let (socket_tx, socket_rx) = unbounded_channel::<TcpSocketCreation>();
             let res = tokio::select! {
-                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx) => v,
+                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, tcp_recv_buffer_size, tcp_send_buffer_size) => v,
                 v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx) => v,
             };
             res?;
@@ -88,6 +87,7 @@ impl TcpListenerRunner {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_packet(
         notify: SharedNotify,
         iface_ingress_tx: UnboundedSender<Vec<u8>>,
@@ -95,6 +95,8 @@ impl TcpListenerRunner {
         mut tcp_rx: Receiver<AnyIpPktFrame>,
         stream_tx: UnboundedSender<TcpStream>,
         socket_tx: UnboundedSender<TcpSocketCreation>,
+        tcp_recv_buffer_size: u32,
+        tcp_send_buffer_size: u32,
     ) -> std::io::Result<()> {
         while let Some(frame) = tcp_rx.recv().await {
             let packet = match IpPacket::new_checked(frame.as_slice()) {
@@ -135,8 +137,8 @@ impl TcpListenerRunner {
             // TCP first handshake packet, create a new Connection
             if packet.syn() && !packet.ack() {
                 let mut socket = TcpSocket::new(
-                    TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE as usize]),
-                    TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE as usize]),
+                    TcpSocketBuffer::new(vec![0u8; tcp_recv_buffer_size as usize]),
+                    TcpSocketBuffer::new(vec![0u8; tcp_send_buffer_size as usize]),
                 );
                 socket.set_keep_alive(Some(Duration::from_secs(28)));
                 // FIXME: It should follow system's setting. 7200 is Linux's default.
@@ -152,9 +154,9 @@ impl TcpListenerRunner {
                 trace!("created TCP connection for {} <-> {}", src_addr, dst_addr);
 
                 let control = Arc::new(SpinMutex::new(TcpSocketControl {
-                    send_buffer: RingBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE as usize]),
+                    send_buffer: RingBuffer::new(vec![0u8; tcp_send_buffer_size as usize]),
                     send_waker: None,
-                    recv_buffer: RingBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE as usize]),
+                    recv_buffer: RingBuffer::new(vec![0u8; tcp_recv_buffer_size as usize]),
                     recv_waker: None,
                     recv_state: TcpSocketState::Normal,
                     send_state: TcpSocketState::Normal,
@@ -338,7 +340,20 @@ impl TcpListenerRunner {
                 socket_set.remove(socket_handle);
             }
 
-            if !iface_ingress_tx_avail.load(Ordering::Acquire) {
+            // Ensure every loop iteration yields to the runtime. When egress
+            // capacity is available OR when `poll_delay` returns ZERO ("re-poll
+            // now"), this loop otherwise takes no `.await`, so under an active
+            // flow it busy-spins. Because `handle_socket` and `handle_packet`
+            // are arms of one `tokio::select!` future, a never-yielding
+            // `handle_socket` never returns control to the sibling SYN-accept
+            // arm: one core pins flat at 100% and new inbound connections are
+            // starved (observed as connect timeouts with no SYN-ACK). A
+            // cooperative `yield_now()` keeps the re-poll just as prompt while
+            // letting `handle_packet` make progress. The timed-park path and the
+            // 5 ms idle fallback are unchanged, so there is no missed-wake risk.
+            if iface_ingress_tx_avail.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            } else {
                 let next_duration = iface
                     .poll_delay(before_poll, &socket_set)
                     .unwrap_or(Duration::from_millis(5));
@@ -348,6 +363,8 @@ impl TcpListenerRunner {
                         notify.notified(),
                     )
                     .await;
+                } else {
+                    tokio::task::yield_now().await;
                 }
             }
         }
@@ -363,6 +380,8 @@ impl TcpListener {
         tcp_rx: Receiver<AnyIpPktFrame>,
         stack_tx: Sender<AnyIpPktFrame>,
         mtu: usize,
+        tcp_recv_buffer_size: u32,
+        tcp_send_buffer_size: u32,
     ) -> std::io::Result<(Runner, Self)> {
         let (mut device, iface_ingress_tx, iface_ingress_tx_avail) =
             VirtualDevice::new(stack_tx, mtu);
@@ -378,6 +397,8 @@ impl TcpListener {
             tcp_rx,
             stream_tx,
             HashMap::new(),
+            tcp_recv_buffer_size,
+            tcp_send_buffer_size,
         );
 
         Ok((runner, Self { stream_rx }))
